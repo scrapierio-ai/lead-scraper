@@ -1,72 +1,76 @@
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, Body, HTTPException
+import uvicorn
+import asyncpg
+import os
+from typing import List, Dict, Optional
 
 # ------------------------ CONFIG ------------------------
-DB_USER = "myuser"
-DB_PASSWORD = "mypassword"
-DB_HOST = "157.230.173.229"
-DB_PORT = 5432
-DB_NAME = "apollo"
+DB_USER = os.getenv("DB_USER", "myuser")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "mypassword")
+DB_HOST = os.getenv("DB_HOST", "157.230.173.229")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "apollo")
 
-# Filters you want to apply (column_name: value)
-FILTERS = {
-    "person_name": "John"
-}
-
-# Columns to retrieve (empty list = all columns)
-COLUMNS = []  # e.g., ["person_name", "person_email", "person_location_city"]
-
-# Chunk size (rows per fetch)
 CHUNK_SIZE = 100_000
 # --------------------------------------------------------
 
-def fetch_leads(filters: dict = None, columns: list = None, chunksize: int = CHUNK_SIZE):
-    # Columns to select
-    select_sql = "*" if not columns else ", ".join(columns)
+app = FastAPI(title="Lead Scraper API", description="API to fetch leads from PostgreSQL database.")
 
-    # Build WHERE clause
-    where_clauses = []
-    values = []
-    if filters:
-        for col, val in filters.items():
-            where_clauses.append(f"{col} ILIKE %s")
-            values.append(f"%{val}%")  # case-insensitive partial match
-
-    where_sql = ""
-    if where_clauses:
-        where_sql = " WHERE " + " AND ".join(where_clauses)
-
-    query = f"SELECT {select_sql} FROM leads{where_sql}"
-
-    # Connect to PostgreSQL
-    conn = psycopg2.connect(
-        dbname=DB_NAME,
+async def get_db_connection():
+    return await asyncpg.connect(
         user=DB_USER,
         password=DB_PASSWORD,
+        database=DB_NAME,
         host=DB_HOST,
         port=DB_PORT
     )
 
-    results = []
-
+@app.post("/leads")
+async def fetch_leads(
+    filters: Optional[Dict[str, str]] = Body(None, description="Filters to apply containing column names and values for partial matching."),
+    columns: Optional[List[str]] = Body(None, description="List of columns to retrieve. Leave empty to retrieve all columns.")
+):
+    """
+    Retrieve leads from the database based on optional filters.
+    """
     try:
-        with conn.cursor(name="leads_cursor", cursor_factory=RealDictCursor) as cursor:
-            # server-side cursor for memory efficiency
-            cursor.itersize = chunksize
-            cursor.execute(query, tuple(values) if values else None)
+        select_sql = "*" if not columns else ", ".join(columns)
+        
+        where_clauses = []
+        values = []
+        
+        if filters:
+            for idx, (col, val) in enumerate(filters.items(), start=1):
+                where_clauses.append(f"{col} ILIKE ${idx}")
+                values.append(f"%{val}%")
 
-            for row in cursor:
-                results.append(dict(row))  # convert each row to dict
-    finally:
-        conn.close()
+        where_sql = ""
+        if where_clauses:
+            where_sql = " WHERE " + " AND ".join(where_clauses)
+            
+        query = f"SELECT {select_sql} FROM leads{where_sql} LIMIT {CHUNK_SIZE}"
+        
+        conn = await get_db_connection()
+        try:
+            # Using asyncpg, which doesn't require libpq system library!
+            if values:
+                records = await conn.fetch(query, *values)
+            else:
+                records = await conn.fetch(query)
+                
+            # Convert asyncpg.Record to dict
+            results = [dict(record) for record in records]
+            return {"status": "success", "count": len(results), "data": results}
+        finally:
+            await conn.close()
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return results
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
-# ------------------------ RUN ------------------------
 if __name__ == "__main__":
-    data = fetch_leads(filters=FILTERS, columns=COLUMNS)
-    print(f"Retrieved {len(data)} rows")
-    if data:
-        # Print first 5 rows
-        for row in data[:5]:
-            print(row)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("lead_scraper:app", host="0.0.0.0", port=port)

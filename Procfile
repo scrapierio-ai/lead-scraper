@@ -1,1 +1,1 @@
-worker: python lead_scraper.py
+web: uvicorn lead_scraper:app --host 0.0.0.0 --port $PORT
